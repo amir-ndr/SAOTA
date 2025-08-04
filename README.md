@@ -29,11 +29,17 @@ This repository contains the implementation of **SAOTA**, a novel **Semi-Asynchr
 ## 🛠️ Code Structure
 .
 ├── client.py # Client-side training, gradient, and energy tracking
+
 ├── server.py # Server logic: client selection, OTA aggregation, optimization
+
 ├── main.py # Simulation and evaluation script
+
 ├── model.py # CNN model used for training on MNIST
+
 ├── dataloader.py # Data loading and Dirichlet partitioning
+
 ├── fl_system.log # Logging file generated during run
+
 ├── semi_async_ota_fl_results.png # Final results visualization
 
 
