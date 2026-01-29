@@ -1,163 +1,217 @@
-import optuna
-import torch
+# main.py
+import os
+import time
+import logging
+import random
 import numpy as np
+import torch
 from torch.utils.data import DataLoader
+
+import optuna
+
 from client import Client
 from server import Server
-from model import CNNMnist
-from dataloader import load_mnist, partition_mnist_noniid
-import time
+from model_cifar import CNNCifar10
+from dataloader import load_cifar10, partition_cifar10_dirichlet
 
-def evaluate_model(model, test_loader, device='cpu'):
+
+# -------------------------
+# Utilities
+# -------------------------
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Deterministic (slower but reproducible). Comment out if you want faster.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+@torch.no_grad()
+def evaluate_model(model, test_loader, device="cpu") -> float:
     model.eval()
     correct, total = 0, 0
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    return 100 * correct / total
+    for images, labels in test_loader:
+        images, labels = images.to(device), labels.to(device)
+        outputs = model(images)
+        predicted = outputs.argmax(dim=1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+    return 100.0 * correct / max(total, 1)
 
-def objective(trial):
-    # Fixed parameters
-    NUM_CLIENTS = 10
-    NUM_ROUNDS = trial.suggest_int("NUM_ROUNDS", 100, 1000)
-    BATCH_SIZE = trial.suggest_categorical("BATCH_SIZE", [16, 32, 64])
-    LOCAL_EPOCHS = 1
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    print(f"Using device: {DEVICE}")
-    
-    # Load and partition dataset
-    train_dataset, test_dataset = load_mnist()
-    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
-    client_data_map = partition_mnist_noniid(train_dataset, NUM_CLIENTS)
-    
-    # Hyperparameters to tune
-    V = trial.suggest_float("V", 5.0, 50.0, log=True)
-    sigma_n = trial.suggest_float("sigma_n", 0.001, 0.1, log=True)
-    tau_cm = trial.suggest_float("tau_cm", 0.001, 0.05)
-    T_max = trial.suggest_int("T_max", 100, 1500)
-    # learning_rate = trial.suggest_float("learning_rate", 0.01, 0.12, log=True)
-    
-    # Energy budget range
-    E_min = trial.suggest_float("E_min", 5.0, 30.0)
-    E_max = trial.suggest_float("E_max", E_min + 3.0, 50.0)
-    
-    # Initialize clients with heterogeneous parameters
+
+def build_clients(
+    num_clients: int,
+    train_dataset,
+    client_data_map,
+    base_model,
+    batch_size: int,
+    device: str,
+    mu_k: float,
+    c_cycles_per_sample: float,
+    seed_base: int,
+):
     clients = []
-    for cid in range(NUM_CLIENTS):
-        indices = client_data_map[cid]
+    for cid in range(num_clients):
+        indices = client_data_map.get(cid, [])
         if len(indices) == 0:
-            indices = [0]  # Ensure at least one sample
-        
-        # Per-client heterogeneity
-        client_fk = np.random.uniform(1e9, 2e9)
-        client_mu_k = np.random.uniform(1e-28, 1e-26)
-        client_P_max = np.random.uniform(1.0, 2.0)
-        
+            indices = [0]  # avoid empty data edge-case
         client = Client(
             client_id=cid,
             data_indices=indices,
-            model=CNNMnist(),
-            fk=client_fk,
-            mu_k=client_mu_k,
-            P_max=client_P_max,
-            C=1e6,
-            Ak=BATCH_SIZE,
+            model=base_model,
+            fk=np.random.uniform(1e9, 2e9),       # 1-2 GHz
+            mu_k=mu_k,
+            P_max=3.0 + np.random.rand(),         # ~[3,4)
+            C=c_cycles_per_sample,
+            Ak=batch_size,
             train_dataset=train_dataset,
-            device=DEVICE,
-            local_epochs=LOCAL_EPOCHS
+            device=device,
+            seed=seed_base + cid,
         )
         clients.append(client)
-    
-    # Energy budgets
-    E_max_dict = {cid: np.random.uniform(E_min, E_max) for cid in range(NUM_CLIENTS)}
-    
-    # Initialize global model and server
-    global_model = CNNMnist().to(DEVICE)
+    return clients
+
+
+def build_energy_budgets(num_clients: int, e_min: float, e_max: float) -> dict:
+    # Per-client total budgets over NUM_ROUNDS
+    return {cid: float(np.random.uniform(e_min, e_max)) for cid in range(num_clients)}
+
+
+# -------------------------
+# Optuna objective
+# -------------------------
+def objective(trial: optuna.Trial) -> float:
+    # ----- search space (as you requested) -----
+    NUM_ROUNDS = trial.suggest_int("NUM_ROUNDS", 1000, 10000)
+
+    BATCH_SIZE = trial.suggest_categorical("BATCH_SIZE", [32, 64])
+
+    V = trial.suggest_float("V", 0.1, 1000.0, log=True)
+    SIGMA_N = trial.suggest_float("SIGMA_N", 1e-6, 1e-3, log=True)
+    T_MAX = trial.suggest_float("T_MAX", 500.0, 10000.0)
+    ETA = trial.suggest_float("ETA", 0.005, 0.1, log=True)
+
+    E_min = trial.suggest_float("E_min", 5.0, 30.0)
+    E_max = trial.suggest_float("E_max", E_min + 3.0, 50.0)
+
+    # ----- fixed experiment settings -----
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    NUM_CLIENTS = 10
+    DIRICHLET_ALPHA = 0.2
+
+    # Client system params (keep consistent with your earlier setup)
+    MU_K = 1e-27
+    C_CYCLES_PER_SAMPLE = 1e6
+
+    # Seed for reproducibility per-trial
+    seed = 1234 + trial.number
+    set_seed(seed)
+
+    # Data
+    train_dataset, test_dataset = load_cifar10()
+    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+
+    # Non-IID split
+    client_data_map = partition_cifar10_dirichlet(train_dataset, NUM_CLIENTS, alpha=DIRICHLET_ALPHA)
+
+    # Build clients & server
+    base_model = CNNCifar10().to(DEVICE)
+    clients = build_clients(
+        num_clients=NUM_CLIENTS,
+        train_dataset=train_dataset,
+        client_data_map=client_data_map,
+        base_model=base_model,
+        batch_size=BATCH_SIZE,
+        device=DEVICE,
+        mu_k=MU_K,
+        c_cycles_per_sample=C_CYCLES_PER_SAMPLE,
+        seed_base=seed * 10,
+    )
+
+    E_max_dict = build_energy_budgets(NUM_CLIENTS, E_min, E_max)
+
+    global_model = CNNCifar10().to(DEVICE)
     server = Server(
         global_model=global_model,
         clients=clients,
         V=V,
-        sigma_n=sigma_n,
-        tau_cm=tau_cm,
-        T_max=T_max,
+        sigma_n=SIGMA_N,
+        T_max=T_MAX,
         E_max=E_max_dict,
         T_total_rounds=NUM_ROUNDS,
-        device=DEVICE
+        eta=ETA,
+        device=DEVICE,
+        bisection_tol=1e-6,
     )
-    
-    # Training loop
-    for round_idx in range(NUM_ROUNDS):
-        round_start = time.time()
-        
-        # 1. Select clients and broadcast current model
-        selected, power_alloc = server.select_clients()
-        selected_ids = [c.client_id for c in selected]
-        
-        # Broadcast model to selected clients
-        server.broadcast_model(selected)
-        
-        # 2. Compute gradients on selected clients
-        comp_times = []
-        for client in selected:
-            start_comp = time.time()
-            client.compute_gradient()
-            comp_time = time.time() - start_comp
-            comp_times.append(comp_time)
-        
-        # 3. Reset staleness AFTER computation (as in your previous version)
-        for client in selected:
-            client.reset_staleness()
-        
-        # 4. Calculate round duration and aggregate
-        max_comp_time = max(comp_times) if selected else 0
-        D_t = max_comp_time + server.tau_cm
-        
-        if selected:
-            aggregated = server.aggregate(selected, power_alloc)
-            server.update_model(aggregated, round_idx)  # Pass round index for LR decay
-        
-        # 5. Update queues
-        server.update_queues(selected, power_alloc, D_t)
-        
-        # 6. Update computation time for ALL clients
-        for client in clients:
-            if client in selected:
-                # Reset for next round (new model)
-                client.reset_computation()
-            else:
-                # Progress computation
-                client.dt_k = max(0, client.dt_k - D_t)
-                client.increment_staleness()
-            
-        # Report intermediate accuracy for pruning
-        if (round_idx + 1) % 10 == 0:
+
+    # Training loop with intermediate evaluation for pruning
+    # Evaluate ~20 times per run (plus initial), so optuna can prune.
+    eval_every = max(10, NUM_ROUNDS // 20)
+
+    best_acc = evaluate_model(server.global_model, test_loader, DEVICE)
+    trial.report(best_acc, step=0)
+    if trial.should_prune():
+        raise optuna.TrialPruned()
+
+    for t in range(NUM_ROUNDS):
+        server.run_round(t)
+
+        # intermediate eval
+        if ((t + 1) % eval_every == 0) or (t == NUM_ROUNDS - 1):
             acc = evaluate_model(server.global_model, test_loader, DEVICE)
-            trial.report(acc, step=round_idx)
-            
-            # Prune if accuracy is poor
-            if acc < 10.0 and round_idx > 50:
+            if acc > best_acc:
+                best_acc = acc
+
+            # Report for pruning (step uses iteration index)
+            trial.report(best_acc, step=t + 1)
+            if trial.should_prune():
                 raise optuna.TrialPruned()
-    
-    # Final accuracy evaluation
-    final_acc = evaluate_model(server.global_model, test_loader, DEVICE)
-    return final_acc
+
+    return float(best_acc)  # maximize best achieved accuracy
+
+
+def main():
+    # Logging (quiet-ish)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    logger = logging.getLogger("optuna_saota")
+
+    # Reduce Optuna verbosity if you want:
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    # Pruner helps a lot because NUM_ROUNDS can be large
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=200)
+
+    study = optuna.create_study(direction="maximize", pruner=pruner)
+
+    # You can change n_trials to what you want.
+    N_TRIALS = 30
+
+    logger.info(f"Starting Optuna study with {N_TRIALS} trials...")
+    start = time.time()
+    study.optimize(objective, n_trials=N_TRIALS, gc_after_trial=True)
+    elapsed = time.time() - start
+
+    best = study.best_trial
+    logger.info(f"Done. Elapsed: {elapsed/60:.1f} min")
+    print("\n===== BEST TRIAL =====")
+    print(f"Best accuracy: {best.value:.4f}")
+    print("Best params:")
+    for k, v in best.params.items():
+        print(f"  {k}: {v}")
+
+    # Optional: save results
+    os.makedirs("optuna_results", exist_ok=True)
+    with open("optuna_results/best_params.txt", "w") as f:
+        f.write(f"Best accuracy: {best.value:.6f}\n")
+        for k, v in best.params.items():
+            f.write(f"{k}: {v}\n")
+    print("\nSaved: optuna_results/best_params.txt")
+
 
 if __name__ == "__main__":
-    # Create study with pruning support
-    study = optuna.create_study(
-        direction="maximize",
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=20)
-    )
-    
-    # Run optimization
-    study.optimize(objective, n_trials=300, timeout=3600)
-    
-    # Print best results
-    print("\nBest trial:")
-    print(f"  Accuracy: {study.best_value:.2f}%")
-    print("  Params:", study.best_params)
+    main()

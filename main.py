@@ -37,15 +37,15 @@ def main():
 
     # ---------------- Parameters ----------------
     NUM_CLIENTS = 10
-    NUM_ROUNDS = 3000
-    BATCH_SIZE = 64
+    NUM_ROUNDS = 9884
+    BATCH_SIZE = 32
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # SAOTA server params (match your server.py signature)
-    V = 100.0
-    SIGMA_N = 1e-5
-    T_MAX = 5000.0
-    ETA = 0.02
+    # SAOTA server params
+    V = 77.23
+    SIGMA_N = 6.287625692659408e-06
+    T_MAX = 2814.156090700375
+    ETA = 0.053
     BISECTION_TOL = 1e-6
 
     # Client system params
@@ -75,23 +75,21 @@ def main():
         client = Client(
             client_id=cid,
             data_indices=indices,
-            model=base_model,  # will be deep-copied inside Client
-            fk=np.random.uniform(1e9, 2e9),       # 1-2 GHz
+            model=base_model,
+            fk=np.random.uniform(1e9, 2e9),
             mu_k=MU_K,
-            P_max=3.0 + np.random.rand(),         # ~[2,3)
+            P_max=3.0 + np.random.rand(),
             C=C_CYCLES_PER_SAMPLE,
             Ak=BATCH_SIZE,
             train_dataset=train_dataset,
             device=DEVICE,
-            seed=cid,  # reproducibility per-client
+            seed=cid,
         )
         clients.append(client)
-
-        # dt_k starts at 0 until computation is started by server
         logger.info(f"Client {cid}: |Dk|={len(indices)} samples, initial dt_k={client.dt_k:.4f}s")
 
     # Per-client total energy budgets (over NUM_ROUNDS)
-    E_max_dict = {cid: float(np.random.uniform(30, 35)) for cid in range(NUM_CLIENTS)}
+    E_max_dict = {cid: float(np.random.uniform(26.37, 33.59)) for cid in range(NUM_CLIENTS)}
     print("Client Energy Budgets:")
     for cid, budget in E_max_dict.items():
         print(f"  Client {cid}: {budget:.2f} J")
@@ -114,17 +112,21 @@ def main():
     # ---------------- Training loop ----------------
     accuracies = []
     eval_rounds = []
+    eval_times = []                 # <-- NEW: x-axis in simulated training time
     round_durations = []
+    cum_train_time = 0.0            # <-- NEW: cumulative simulated time (sum of D_t)
+
     energy_queues_max = []
     time_queue_hist = []
     avg_staleness_per_round = []
     selected_counts = []
     client_selection_counts = {cid: 0 for cid in range(NUM_CLIENTS)}
 
-    # initial eval
+    # initial eval (time = 0)
     acc0 = evaluate_model(server.global_model, test_loader, DEVICE)
     accuracies.append(acc0)
     eval_rounds.append(0)
+    eval_times.append(0.0)          # <-- NEW
     logger.info(f"Initial accuracy: {acc0:.2f}%")
     print(f"Initial accuracy: {acc0:.2f}%")
 
@@ -132,7 +134,6 @@ def main():
         round_start = time.time()
         print(f"\n=== Round {t+1}/{NUM_ROUNDS} ===")
 
-        # Run one SAOTA round (this performs: start compute -> select -> elapse -> power -> OTA -> update -> broadcast -> staleness -> queues)
         selected, power_alloc, D_t = server.run_round(t)
 
         selected_ids = [c.client_id for c in selected]
@@ -140,8 +141,16 @@ def main():
         for cid in selected_ids:
             client_selection_counts[cid] += 1
 
-        # Record metrics
-        round_durations.append(float(D_t))
+        # Record duration + update cumulative simulated training time
+        D_t = float(D_t)
+        round_durations.append(D_t)
+
+        # If you want to avoid flat time-axis due to D_t == 0, uncomment:
+        # D_t = max(D_t, 1e-9)
+
+        cum_train_time += D_t
+
+        # Record other metrics
         max_energy_q = max(server.Q_e.values()) if server.Q_e else 0.0
         energy_queues_max.append(float(max_energy_q))
         time_queue_hist.append(float(server.Q_time))
@@ -151,23 +160,25 @@ def main():
         wall_time = time.time() - round_start
 
         print(f"Selected {len(selected_ids)} clients: {selected_ids}")
-        print(f"D_t: {D_t:.4f}s | wall: {wall_time:.2f}s | "
+        print(f"D_t: {D_t:.4f}s | cum_train_time: {cum_train_time:.4f}s | wall: {wall_time:.2f}s | "
               f"max Q_e: {max_energy_q:.2f} | Q_time: {server.Q_time:.2f} | "
               f"avg staleness: {avg_tau:.2f}")
 
-        # Evaluate every 5 rounds (and last round)
+        # Evaluate every 5 rounds (and last round) --- record accuracy vs TRAINING TIME
         if ((t + 1) % 5 == 0) or (t == NUM_ROUNDS - 1):
             acc = evaluate_model(server.global_model, test_loader, DEVICE)
             accuracies.append(acc)
             eval_rounds.append(t + 1)
+            eval_times.append(cum_train_time)     # <-- NEW: accuracy timestamp in simulated time
             print(f"Global model accuracy: {acc:.2f}%")
-            logger.info(f"Eval @ round {t+1}: acc={acc:.2f}%")
+            logger.info(f"Eval @ round {t+1}: acc={acc:.2f}% | time={cum_train_time:.4f}s")
 
     # ---------------- Summary ----------------
     final_acc = accuracies[-1]
     print("\n=== Training Complete ===")
     print(f"Final accuracy: {final_acc:.2f}%")
-    print(f"Average round duration: {np.mean(round_durations):.2f}s")
+    print(f"Average round duration: {np.mean(round_durations):.4f}s")
+    print(f"Total simulated training time: {cum_train_time:.4f}s")
     print(f"Max energy queue: {max(energy_queues_max) if energy_queues_max else 0.0:.2f}")
 
     print("\nClient Selection Statistics:")
@@ -190,31 +201,31 @@ def main():
     # ---------------- Plots ----------------
     plt.figure(figsize=(15, 12))
 
-    # Accuracy
+    # Accuracy vs simulated training time
     plt.subplot(321)
-    plt.plot(eval_rounds, accuracies, "o-")
-    plt.title("Test Accuracy")
-    plt.xlabel("Rounds")
+    plt.plot(eval_times, accuracies, "o-")
+    plt.title("Test Accuracy vs Simulated Training Time")
+    plt.xlabel("Simulated Training Time (sum of D_t)")
     plt.ylabel("Accuracy (%)")
     plt.grid(True)
 
     # Selected clients per round
     plt.subplot(322)
-    plt.plot(selected_counts)
-    plt.title("Selected Clients per Round")
-    plt.xlabel("Rounds")
+    plt.plot(np.cumsum(round_durations), selected_counts)  # optional: show vs time
+    plt.title("Selected Clients vs Simulated Time")
+    plt.xlabel("Simulated Training Time")
     plt.ylabel("Number of Clients")
     plt.grid(True)
 
-    # Max energy queue
+    # Max energy queue (vs time)
     plt.subplot(323)
-    plt.plot(energy_queues_max)
-    plt.title("Max Energy Queue Value")
-    plt.xlabel("Rounds")
+    plt.plot(np.cumsum(round_durations), energy_queues_max)
+    plt.title("Max Energy Queue Value vs Simulated Time")
+    plt.xlabel("Simulated Training Time")
     plt.ylabel("Queue Value")
     plt.grid(True)
 
-    # Per-client cumulative energy
+    # Per-client cumulative energy (x-axis: rounds; you can also do vs time if you want)
     plt.subplot(324)
     for cid in range(NUM_CLIENTS):
         per_round = [float(server.per_round_energy[r].get(cid, 0.0)) for r in range(len(server.per_round_energy))]
@@ -226,11 +237,11 @@ def main():
     plt.legend(fontsize=7, loc="upper left", ncol=2)
     plt.grid(True)
 
-    # Avg staleness
+    # Avg staleness (vs time)
     plt.subplot(325)
-    plt.plot(avg_staleness_per_round)
-    plt.title("Average Client Staleness")
-    plt.xlabel("Rounds")
+    plt.plot(np.cumsum(round_durations), avg_staleness_per_round)
+    plt.title("Average Client Staleness vs Simulated Time")
+    plt.xlabel("Simulated Training Time")
     plt.ylabel("Staleness (rounds)")
     plt.grid(True)
 
@@ -244,7 +255,7 @@ def main():
     plt.grid(True)
 
     plt.tight_layout(pad=3.0)
-    plt.savefig("semi_async_ota_fl_results.png", dpi=300)
+    plt.savefig("semi_async_ota_fl_results_time_based.png", dpi=300)
     plt.show()
 
 
