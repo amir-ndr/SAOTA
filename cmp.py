@@ -10,11 +10,10 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
 from client import Client
-from server import Server  # your SAOTA server
-from server_dynamic import ServerDynamicBaseline  # baseline above
-from model_cifar import CNNCifar10
+from server import Server  # SAOTA server
+from server_dynamic import ServerDynamicBaseline  # synchronous baseline
 from model import CNNMnist
-from dataloader import load_cifar10, partition_cifar10_dirichlet, load_mnist, partition_mnist_dirichlet
+from dataloader import load_mnist, partition_mnist_dirichlet
 
 
 # -------------------------
@@ -30,7 +29,7 @@ NUM_ROUNDS = 300
 BATCH_SIZE = 32
 EVAL_EVERY = 5
 
-# Shared system params (your SAOTA best-like values)
+# Shared system params
 SIGMA_N = 6.287625692659408e-06
 T_MAX = 2814.156090700375
 ETA = 0.053
@@ -40,8 +39,8 @@ BISECTION_TOL = 1e-6
 SAOTA_V = 77.23
 
 # Baseline-specific
-BASELINE_V = 77.23       # keep same V for fair penalty scaling
-BASELINE_P_FIXED = 1.0   # fixed transmit power baseline (can sweep later)
+BASELINE_V = 77.23
+BASELINE_P_FIXED = 1.0
 
 # Client params
 MU_K = 1e-27
@@ -87,6 +86,7 @@ def build_clients(train_dataset, client_data_map, base_model):
         indices = client_data_map.get(cid, [])
         if len(indices) == 0:
             indices = [0]
+
         client = Client(
             client_id=cid,
             data_indices=indices,
@@ -113,101 +113,134 @@ def unified_cum_energy(cum_energy_per_client: dict, E_max_dict: dict) -> float:
 
 
 # -------------------------
-# Run one method and log time-based metrics
+# Run one method and log SIM-time metrics
 # -------------------------
 def run_method(method_name: str, server_obj, clients, E_max_dict, test_loader):
     """
     Returns:
-      times_eval: list of wall-clock seconds from start (only at eval points)
-      acc_eval:   list of accuracies at those times
-      times_round: list of wall-clock seconds from start for each round end
-      unified_energy_round: list unified energy at each round end (len = NUM_ROUNDS+1)
-      avg_staleness_round: list avg staleness at each round end (len = NUM_ROUNDS+1)
-      selected_count_round: list selected count at each round end (len = NUM_ROUNDS+1)
-      per_client_cum_energy: dict cid -> total energy
-    """
-    t0 = time.time()
+      eval_sim_t: list of simulated time (sec) at eval points
+      eval_wall_t: list of wall time (sec) at eval points
+      acc_eval: list accuracy at eval points
 
-    # round 0 metrics
+      round_sim_t: list of simulated time (sec) after each round (len NUM_ROUNDS+1)
+      round_wall_t: list of wall time (sec) after each round (len NUM_ROUNDS+1)
+
+      unified_energy_round: list unified cumulative energy at each round end (len NUM_ROUNDS+1)
+      avg_staleness_round: list avg staleness at each round end (len NUM_ROUNDS+1)
+      selected_count_round: list selected count at each round end (len NUM_ROUNDS+1)
+
+      cum_energy_per_client: dict cid -> total energy (J)
+    """
+    t0_wall = time.time()
+    cum_sim_time = 0.0
+
+    # Round 0
     acc0 = evaluate_model(server_obj.global_model, test_loader, DEVICE)
-    times_eval = [0.0]
+
+    eval_sim_t = [0.0]
+    eval_wall_t = [0.0]
     acc_eval = [acc0]
 
-    times_round = [0.0]
+    round_sim_t = [0.0]
+    round_wall_t = [0.0]
     selected_count_round = [0]
-    avg_staleness_round = [float(np.mean([c.tau_k for c in clients]))]
+    avg_staleness_round = [float(np.mean([c.tau_k for c in clients])) if clients else 0.0]
     unified_energy_round = [0.0]
 
-    # track cumulative energy from server.per_round_energy (same style for both)
     cum_energy_per_client = {cid: 0.0 for cid in E_max_dict.keys()}
 
     for t in range(NUM_ROUNDS):
+        # Run one round
         selected, power_alloc, D_t = server_obj.run_round(t)
 
-        # wall time (seconds) at end of round
-        tr = time.time() - t0
-        times_round.append(tr)
+        # Update simulated time
+        D_t = float(D_t)
+        cum_sim_time += D_t
+
+        # Update wall time
+        wall_elapsed = time.time() - t0_wall
+
+        # Round time series
+        round_sim_t.append(cum_sim_time)
+        round_wall_t.append(wall_elapsed)
 
         selected_ids = [c.client_id for c in selected]
         selected_count_round.append(len(selected_ids))
 
-        # energy update
-        round_energy_dict = server_obj.per_round_energy[-1] if len(server_obj.per_round_energy) > 0 else {}
+        # Energy update from server.per_round_energy (must be present for BOTH methods)
+        round_energy_dict = server_obj.per_round_energy[-1] if server_obj.per_round_energy else {}
         for cid, e in round_energy_dict.items():
             cum_energy_per_client[int(cid)] += float(e)
 
         unified_energy_round.append(unified_cum_energy(cum_energy_per_client, E_max_dict))
+        avg_staleness_round.append(float(np.mean([c.tau_k for c in clients])) if clients else 0.0)
 
-        avg_staleness_round.append(float(np.mean([c.tau_k for c in clients])))
-
-        # eval
+        # Eval every EVAL_EVERY rounds (and last)
         if ((t + 1) % EVAL_EVERY == 0) or (t == NUM_ROUNDS - 1):
             acc = evaluate_model(server_obj.global_model, test_loader, DEVICE)
-            times_eval.append(time.time() - t0)
             acc_eval.append(acc)
+            eval_sim_t.append(cum_sim_time)
+            eval_wall_t.append(wall_elapsed)
 
     return (
-        times_eval,
-        acc_eval,
-        times_round,
-        unified_energy_round,
-        avg_staleness_round,
-        selected_count_round,
+        eval_sim_t, eval_wall_t, acc_eval,
+        round_sim_t, round_wall_t,
+        unified_energy_round, avg_staleness_round, selected_count_round,
         cum_energy_per_client,
     )
 
 
-def save_csv(method_name: str, times_round, unified_energy_round, avg_staleness_round, selected_count_round,
-             times_eval, acc_eval, cum_energy_per_client):
+def save_csv(
+    method_name: str,
+    eval_sim_t, eval_wall_t, acc_eval,
+    round_sim_t, round_wall_t,
+    unified_energy_round, avg_staleness_round, selected_count_round,
+    cum_energy_per_client,
+):
     method_dir = os.path.join(OUT_DIR, method_name)
     os.makedirs(method_dir, exist_ok=True)
 
-    # per-round time series
+    # Per-round time series
     with open(os.path.join(method_dir, "round_metrics.csv"), "w", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["round", "wall_time_sec", "unified_cumulative_energy", "avg_staleness", "selected_count"],
+            fieldnames=[
+                "round",
+                "sim_time_sec",
+                "wall_time_sec",
+                "unified_cumulative_energy",
+                "avg_staleness",
+                "selected_count",
+            ],
         )
         writer.writeheader()
-        for r in range(len(times_round)):
+        for r in range(len(round_sim_t)):
             writer.writerow(
                 {
                     "round": r,
-                    "wall_time_sec": f"{times_round[r]:.6f}",
+                    "sim_time_sec": f"{round_sim_t[r]:.6f}",
+                    "wall_time_sec": f"{round_wall_t[r]:.6f}",
                     "unified_cumulative_energy": f"{unified_energy_round[r]:.6f}",
                     "avg_staleness": f"{avg_staleness_round[r]:.6f}",
                     "selected_count": int(selected_count_round[r]),
                 }
             )
 
-    # eval points
+    # Eval points
     with open(os.path.join(method_dir, "eval_metrics.csv"), "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["eval_idx", "wall_time_sec", "accuracy"])
+        writer = csv.DictWriter(f, fieldnames=["eval_idx", "sim_time_sec", "wall_time_sec", "accuracy"])
         writer.writeheader()
-        for i in range(len(times_eval)):
-            writer.writerow({"eval_idx": i, "wall_time_sec": f"{times_eval[i]:.6f}", "accuracy": f"{acc_eval[i]:.6f}"})
+        for i in range(len(acc_eval)):
+            writer.writerow(
+                {
+                    "eval_idx": i,
+                    "sim_time_sec": f"{eval_sim_t[i]:.6f}",
+                    "wall_time_sec": f"{eval_wall_t[i]:.6f}",
+                    "accuracy": f"{acc_eval[i]:.6f}",
+                }
+            )
 
-    # per-client energy
+    # Per-client energy
     with open(os.path.join(method_dir, "client_energy.csv"), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["client_id", "total_energy"])
         writer.writeheader()
@@ -219,7 +252,7 @@ def plot_comparison():
     methods = ["SAOTA", "BASELINE"]
     plt.figure(figsize=(15, 10))
 
-    # -------- (1) Accuracy vs time --------
+    # -------- (1) Accuracy vs simulated time --------
     plt.subplot(2, 2, 1)
     for m in methods:
         eval_path = os.path.join(OUT_DIR, m, "eval_metrics.csv")
@@ -229,17 +262,18 @@ def plot_comparison():
         with open(eval_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                tvals.append(float(row["wall_time_sec"]))
+                tvals.append(float(row["sim_time_sec"]))
                 avals.append(float(row["accuracy"]))
         plt.plot(tvals, avals, "o-", label=m)
-    plt.title("Accuracy vs Elapsed Time")
-    plt.xlabel("Elapsed Time (s)")
+
+    plt.title("Accuracy vs Simulated Training Time")
+    plt.xlabel("Simulated Time (s)  [sum of D_t]")
     plt.ylabel("Accuracy (%)")
     plt.ylim(0, 100)
     plt.grid(True)
     plt.legend()
 
-    # -------- (2) Unified cumulative energy vs time --------
+    # -------- (2) Unified cumulative energy vs simulated time --------
     plt.subplot(2, 2, 2)
     for m in methods:
         round_path = os.path.join(OUT_DIR, m, "round_metrics.csv")
@@ -249,17 +283,18 @@ def plot_comparison():
         with open(round_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                tvals.append(float(row["wall_time_sec"]))
+                tvals.append(float(row["sim_time_sec"]))
                 evals.append(float(row["unified_cumulative_energy"]))
         plt.plot(tvals, evals, label=m)
-    plt.title("Unified Cumulative Energy vs Elapsed Time")
-    plt.xlabel("Elapsed Time (s)")
+
+    plt.title("Unified Cumulative Energy vs Simulated Time")
+    plt.xlabel("Simulated Time (s)  [sum of D_t]")
     plt.ylabel("Max Normalized Energy")
     plt.ylim(0, 1.1)
     plt.grid(True)
     plt.legend()
 
-    # -------- (3) Selection fraction vs time --------
+    # -------- (3) Selection fraction vs simulated time --------
     plt.subplot(2, 2, 3)
     for m in methods:
         round_path = os.path.join(OUT_DIR, m, "round_metrics.csv")
@@ -269,17 +304,18 @@ def plot_comparison():
         with open(round_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                tvals.append(float(row["wall_time_sec"]))
+                tvals.append(float(row["sim_time_sec"]))
                 fracs.append(float(row["selected_count"]) / float(NUM_CLIENTS))
         plt.plot(tvals, fracs, label=m)
-    plt.title("Selection Fraction vs Elapsed Time")
-    plt.xlabel("Elapsed Time (s)")
+
+    plt.title("Selection Fraction vs Simulated Time")
+    plt.xlabel("Simulated Time (s)  [sum of D_t]")
     plt.ylabel("Selected/Clients (0-1)")
     plt.ylim(0, 1.1)
     plt.grid(True)
     plt.legend()
 
-    # -------- (4) Avg staleness vs time --------
+    # -------- (4) Avg staleness vs simulated time --------
     plt.subplot(2, 2, 4)
     for m in methods:
         round_path = os.path.join(OUT_DIR, m, "round_metrics.csv")
@@ -289,27 +325,28 @@ def plot_comparison():
         with open(round_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                tvals.append(float(row["wall_time_sec"]))
+                tvals.append(float(row["sim_time_sec"]))
                 svals.append(float(row["avg_staleness"]))
         plt.plot(tvals, svals, label=m)
-    plt.title("Average Staleness vs Elapsed Time")
-    plt.xlabel("Elapsed Time (s)")
+
+    plt.title("Average Staleness vs Simulated Time")
+    plt.xlabel("Simulated Time (s)  [sum of D_t]")
     plt.ylabel("Staleness (rounds)")
     plt.grid(True)
     plt.legend()
 
     plt.tight_layout()
-    out_path = os.path.join(OUT_DIR, "comparison_time_based_2x2.png")
+    out_path = os.path.join(OUT_DIR, "comparison_sim_time_2x2.png")
     plt.savefig(out_path, dpi=300)
     plt.close()
     print(f"[Saved] {out_path}")
-
 
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logger = logging.getLogger("Compare")
 
+    # Use identical seeds for fair comparison (same partition + similar randomness)
     set_seed(123)
 
     # Data
@@ -324,6 +361,7 @@ def main():
 
     # ---------------- SAOTA ----------------
     logger.info("=== Running SAOTA ===")
+    set_seed(123)
     base_model_saota = CNNMnist().to(DEVICE)
     clients_saota = build_clients(train_dataset, client_data_map, base_model_saota)
 
@@ -346,8 +384,8 @@ def main():
 
     # ---------------- Baseline ----------------
     logger.info("=== Running BASELINE ===")
-    base_model_base = CNNMnist().to(DEVICE)
     set_seed(123)
+    base_model_base = CNNMnist().to(DEVICE)
     clients_base = build_clients(train_dataset, client_data_map, base_model_base)
 
     global_model_base = CNNMnist().to(DEVICE)
