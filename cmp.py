@@ -216,12 +216,13 @@ def save_csv(method_name: str, times_round, unified_energy_round, avg_staleness_
 
 
 def plot_comparison():
-    plt.figure(figsize=(14, 6))
+    methods = ["SAOTA", "BASELINE"]
+    plt.figure(figsize=(15, 10))
 
-    # Accuracy vs time
-    plt.subplot(1, 2, 1)
-    for method_name in ["SAOTA", "BASELINE"]:
-        eval_path = os.path.join(OUT_DIR, method_name, "eval_metrics.csv")
+    # -------- (1) Accuracy vs time --------
+    plt.subplot(2, 2, 1)
+    for m in methods:
+        eval_path = os.path.join(OUT_DIR, m, "eval_metrics.csv")
         if not os.path.exists(eval_path):
             continue
         tvals, avals = [], []
@@ -230,18 +231,18 @@ def plot_comparison():
             for row in reader:
                 tvals.append(float(row["wall_time_sec"]))
                 avals.append(float(row["accuracy"]))
-        plt.plot(tvals, avals, "o-", label=method_name)
-
-    plt.title("Accuracy vs Elapsed Time (seconds)")
+        plt.plot(tvals, avals, "o-", label=m)
+    plt.title("Accuracy vs Elapsed Time")
     plt.xlabel("Elapsed Time (s)")
     plt.ylabel("Accuracy (%)")
+    plt.ylim(0, 100)
     plt.grid(True)
     plt.legend()
 
-    # Unified cumulative energy vs time
-    plt.subplot(1, 2, 2)
-    for method_name in ["SAOTA", "BASELINE"]:
-        round_path = os.path.join(OUT_DIR, method_name, "round_metrics.csv")
+    # -------- (2) Unified cumulative energy vs time --------
+    plt.subplot(2, 2, 2)
+    for m in methods:
+        round_path = os.path.join(OUT_DIR, m, "round_metrics.csv")
         if not os.path.exists(round_path):
             continue
         tvals, evals = [], []
@@ -250,20 +251,59 @@ def plot_comparison():
             for row in reader:
                 tvals.append(float(row["wall_time_sec"]))
                 evals.append(float(row["unified_cumulative_energy"]))
-        plt.plot(tvals, evals, label=method_name)
-
+        plt.plot(tvals, evals, label=m)
     plt.title("Unified Cumulative Energy vs Elapsed Time")
     plt.xlabel("Elapsed Time (s)")
     plt.ylabel("Max Normalized Energy")
+    plt.ylim(0, 1.1)
     plt.grid(True)
     plt.legend()
+
+    # -------- (3) Selection fraction vs time --------
+    plt.subplot(2, 2, 3)
+    for m in methods:
+        round_path = os.path.join(OUT_DIR, m, "round_metrics.csv")
+        if not os.path.exists(round_path):
+            continue
+        tvals, fracs = [], []
+        with open(round_path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                tvals.append(float(row["wall_time_sec"]))
+                fracs.append(float(row["selected_count"]) / float(NUM_CLIENTS))
+        plt.plot(tvals, fracs, label=m)
+    plt.title("Selection Fraction vs Elapsed Time")
+    plt.xlabel("Elapsed Time (s)")
+    plt.ylabel("Selected/Clients (0-1)")
     plt.ylim(0, 1.1)
+    plt.grid(True)
+    plt.legend()
+
+    # -------- (4) Avg staleness vs time --------
+    plt.subplot(2, 2, 4)
+    for m in methods:
+        round_path = os.path.join(OUT_DIR, m, "round_metrics.csv")
+        if not os.path.exists(round_path):
+            continue
+        tvals, svals = [], []
+        with open(round_path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                tvals.append(float(row["wall_time_sec"]))
+                svals.append(float(row["avg_staleness"]))
+        plt.plot(tvals, svals, label=m)
+    plt.title("Average Staleness vs Elapsed Time")
+    plt.xlabel("Elapsed Time (s)")
+    plt.ylabel("Staleness (rounds)")
+    plt.grid(True)
+    plt.legend()
 
     plt.tight_layout()
-    out_path = os.path.join(OUT_DIR, "comparison_accuracy_energy_time.png")
+    out_path = os.path.join(OUT_DIR, "comparison_time_based_2x2.png")
     plt.savefig(out_path, dpi=300)
     plt.close()
     print(f"[Saved] {out_path}")
+
 
 
 def main():
@@ -307,6 +347,7 @@ def main():
     # ---------------- Baseline ----------------
     logger.info("=== Running BASELINE ===")
     base_model_base = CNNMnist().to(DEVICE)
+    set_seed(123)
     clients_base = build_clients(train_dataset, client_data_map, base_model_base)
 
     global_model_base = CNNMnist().to(DEVICE)
