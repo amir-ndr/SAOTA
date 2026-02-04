@@ -69,44 +69,68 @@ class Server:
     # Priority score (Equation 12) WITHOUT EMA
     # ρ_k^t = [(τ_k^t/τ_max)*(|h|²/h_ref)] / [ Qe*‖g_last‖²/(E_max/T) + Q_time*d/(T_max/T) ]
     # -------------------------
+    # def _priority_score(self, client, h_ref_abs2, eps=1e-12):
+    #     cid = client.client_id
+
+    #     # Get max staleness for normalization
+    #     tau_max = max(c.tau_k for c in self.clients) if self.clients else 1.0
+    #     tau_max = max(tau_max, 1.0)  # Ensure at least 1
+        
+    #     h_abs2 = float(np.abs(client.h_t_k) ** 2) if client.h_t_k is not None else eps
+
+    #     # Use last gradient norm squared (no EMA)
+    #     G_last = getattr(client, "grad_sqnorm", 0.0)
+    #     if G_last <= 0.0:
+    #         G_last = 1.0  # Default value if no gradient yet
+
+    #     # Per-round allowances for normalization
+    #     E_allow = self.E_max[cid] / self.T_total_rounds
+    #     T_allow = self.T_max / self.T_total_rounds
+
+    #     # Avoid division by zero
+    #     if E_allow < eps:
+    #         E_allow = eps
+    #     if T_allow < eps:
+    #         T_allow = eps
+
+    #     # Numerator: (τ_k^t/τ_max) * (|h|²/h_ref)
+    #     # Paper uses h_ref^t = max_i |h_i^t|^2 for normalization
+    #     numerator = ((client.tau_k+1) / (tau_max+1)) * (h_abs2 / (h_ref_abs2 + eps))
+
+    #     # Denominator: Qe*‖g_last‖²/(E_max/T) + Q_time*d/(T_max/T)
+    #     # Each term normalized by per-round allowance
+    #     denom_term1 = (self.Q_e[cid] * G_last) / E_allow
+    #     denom_term2 = (self.Q_time * client.dt_k) / T_allow
+    #     denominator = denom_term1 + denom_term2
+        
+    #     # Avoid division by zero
+    #     denominator = max(denominator, eps)
+
+    #     return numerator / denominator
     def _priority_score(self, client, h_ref_abs2, eps=1e-12):
         cid = client.client_id
+        tau_max = max(max(c.tau_k for c in self.clients), 1)
 
-        # Get max staleness for normalization
-        tau_max = max(c.tau_k for c in self.clients) if self.clients else 1.0
-        tau_max = max(tau_max, 1.0)  # Ensure at least 1
-        
-        h_abs2 = float(np.abs(client.h_t_k) ** 2) if client.h_t_k is not None else eps
+        h_abs2 = float(np.abs(client.h_t_k)**2) if client.h_t_k is not None else eps
+        G_last = max(getattr(client, "grad_sqnorm", 0.0), eps)
 
-        # Use last gradient norm squared (no EMA)
-        G_last = getattr(client, "grad_sqnorm", 0.0)
-        if G_last <= 0.0:
-            G_last = 1.0  # Default value if no gradient yet
+        E_allow = max(self.E_max[cid] / self.T_total_rounds, eps)
+        T_allow = max(self.T_max / self.T_total_rounds, eps)
 
-        # Per-round allowances for normalization
-        E_allow = self.E_max[cid] / self.T_total_rounds
-        T_allow = self.T_max / self.T_total_rounds
+        # ---- V-dependent energy harshness ----
+        V0 = 1e5          # pick ~ your typical V scale
+        gamma = 1.0
+        lambda_V = (self.V / V0) ** gamma
+        # -------------------------------------
 
-        # Avoid division by zero
-        if E_allow < eps:
-            E_allow = eps
-        if T_allow < eps:
-            T_allow = eps
+        numerator = ((client.tau_k + 1) / (tau_max + 1)) * (h_abs2 / (h_ref_abs2 + eps))
 
-        # Numerator: (τ_k^t/τ_max) * (|h|²/h_ref)
-        # Paper uses h_ref^t = max_i |h_i^t|^2 for normalization
-        numerator = (client.tau_k / tau_max) * (h_abs2 / (h_ref_abs2 + eps))
+        denom_energy = (self.Q_e[cid] * G_last) / E_allow
+        denom_time   = (self.Q_time * client.dt_k) / T_allow
 
-        # Denominator: Qe*‖g_last‖²/(E_max/T) + Q_time*d/(T_max/T)
-        # Each term normalized by per-round allowance
-        denom_term1 = (self.Q_e[cid] * G_last) / E_allow
-        denom_term2 = (self.Q_time * client.dt_k) / T_allow
-        denominator = denom_term1 + denom_term2
-        
-        # Avoid division by zero
-        denominator = max(denominator, eps)
+        denominator = (1.0 + lambda_V) * denom_energy + denom_time
+        return numerator / max(denominator, eps)
 
-        return numerator / denominator
 
     # -------------------------
     # Power allocation via KKT + bisection (CORRECTED)
@@ -182,6 +206,7 @@ class Server:
                 S_low = S_mid
             else:
                 S_high = S_mid
+        S_star = (S_low + S_high) / 2.0
         
         # Compute final powers
         S3 = S_star ** 3
@@ -223,7 +248,9 @@ class Server:
                 G_last = 1.0
 
             # Computation energy (always for selected clients)
-            E_cmp = float(client.mu_k * (client.fk ** 2) * client.C * client.Ak)
+            # E_cmp = float(client.mu_k * (client.fk ** 2) * client.C * client.Ak)
+            steps = getattr(client, "local_steps", 1)
+            E_cmp = float(client.mu_k * (client.fk ** 2) * client.C * client.Ak * max(steps, 1))
             
             # Transmission energy: p² * ‖g‖² / |h|²
             E_tx = (p ** 2) * (G_last / h_abs2)
@@ -351,7 +378,7 @@ class Server:
         round_energy = 0.0
         round_client_energy = {}
 
-        for c in selected:
+        for c in self.clients:
             cid = c.client_id
             p = float(power_alloc.get(cid, 0.0))
             h_abs2 = float(np.abs(c.h_t_k) ** 2) + eps
@@ -362,12 +389,13 @@ class Server:
                 G = 0.0
 
             # Computation energy
-            E_cmp = float(c.mu_k * (c.fk ** 2) * c.C * c.Ak)
+            steps = getattr(c, "local_steps", 1)
+            E_cmp = float(c.mu_k * (c.fk ** 2) * c.C * c.Ak * max(steps, 1))
             
             # Transmission energy: p² * ‖g‖² / |h|²
             E_tx = (p ** 2) * (G / h_abs2)
 
-            E_k = E_cmp + E_tx
+            E_k = E_tx #+ E_cmp
             round_energy += E_k
 
             self.cumulative_energy_per_client[cid] += E_k
@@ -377,6 +405,7 @@ class Server:
             per_round_budget = self.E_max[cid] / self.T_total_rounds
             self.Q_e[cid] = max(0.0, self.Q_e[cid] + (E_k - per_round_budget))
 
+        print(round_client_energy)
         self.total_energy_per_round.append(round_energy)
         self.per_round_energy.append(round_client_energy)
 
@@ -391,29 +420,25 @@ class Server:
     # One full round - CORRECTED for no-EMA
     # -------------------------
     def run_round(self, t):
-        # 1) Start computation for idle clients (no buffered gradient, not already computing)
+        # 1) Start computation for idle clients
         for c in self.clients:
-            if hasattr(c, "maybe_start_local_computation"):
-                c.maybe_start_local_computation()
+            c.maybe_start_local_computation()
 
-        # 2) Select clients + temporary power (selection-time)
+        # 2) Select clients
         selected, _ = self.select_clients()
-
-        # Safety: ensure at least one selected client (avoids varsigma=0 / inf objective)
         if len(selected) == 0:
             logger.warning("No clients selected; forcing selection of one client.")
             selected = [self.clients[np.random.randint(len(self.clients))]]
 
-        # 3) Round duration determined by slowest selected client
+        # 3) Round duration = slowest selected compute remaining time
         D_t = max((c.dt_k for c in selected), default=0.0)
 
-        # 4) Elapse time for ALL clients (some may finish and buffer gradients here)
+        # 4) Time elapses for ALL clients
         for c in self.clients:
-            if hasattr(c, "advance_time"):
-                c.advance_time(D_t)
+            c.advance_time(D_t)
 
-        # 5) Verify selected clients are ready; if not, wait extra until they are (optional but safer)
-        not_ready = [c for c in selected if hasattr(c, "is_ready") and not c.is_ready()]
+        # 5) If selected not ready, wait extra (and elapse for ALL clients)
+        not_ready = [c for c in selected if not c.is_ready()]
         if len(not_ready) > 0:
             extra_wait = max((c.dt_k for c in not_ready), default=0.0)
             if extra_wait > 0.0:
@@ -421,34 +446,26 @@ class Server:
                 for c in self.clients:
                     c.advance_time(extra_wait)
 
-            still_not_ready = [c.client_id for c in selected if hasattr(c, "is_ready") and not c.is_ready()]
-            if len(still_not_ready) > 0:
-                logger.warning(f"Selected clients still not ready after extra wait: {still_not_ready}")
-
-        # 6) Final power allocation using actual buffered gradients (no-EMA case)
+        # 6) Power allocation
         final_powers = self._compute_power(selected, use_predicted=False)
-
-        # --- IMPORTANT: snapshot norms BEFORE any reset, for correct energy accounting ---
-        grad_sqnorm_snapshot = {c.client_id: float(getattr(c, "grad_sqnorm", 0.0)) for c in selected}
 
         # 7) OTA aggregation + global update
         update = self.aggregate(selected, final_powers)
         self.update_model(update)
 
-        # 8) Queue updates MUST happen before resetting selected clients (otherwise grad_sqnorm becomes 0)
-        # Pass snapshot if you update update_queues to accept it; otherwise, it will still work because
-        # we haven't reset yet. Snapshot is kept here as a safety / future-proofing.
+        # 8) Queue update (before resetting selected)
         self.update_queues(selected, final_powers, D_t)
 
-        # 9) Broadcast only to selected clients (this resets tau_k and clears buffers)
+        # 9) Broadcast only to selected clients
         global_state = self.global_model.state_dict()
         for c in selected:
             c.receive_model_and_reset(global_state)
 
-        # 10) Staleness update for non-selected
+        # 10) Increment staleness for non-selected
         selected_ids = {c.client_id for c in selected}
         for c in self.clients:
             if c.client_id not in selected_ids:
                 c.increment_staleness_and_keep_buffer()
 
         return selected, final_powers, D_t
+

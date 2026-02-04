@@ -17,29 +17,22 @@ from dataloader import load_cifar10, partition_cifar10_dirichlet
 # -------------------------
 # Configuration
 # -------------------------
-RESULT_ROOT = "results_v_study2"
+RESULT_ROOT = "results_v_study2_new"
 
-V_VALUES = [0.01, 0.1, 1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-# V_VALUES = [0.01, 100]
+V_VALUES = [100, 1000, 5000, 10000, 50000, 100000, 150000, 200000, 350000, 500000]
 
 NUM_CLIENTS = 10
-
-# Your plotting template often uses 300; keep consistent
-NUM_ROUNDS = 5000
-
-# independent runs (seeds) per V (averaged in plots)
-N_RUNS_PER_V = 1
-
-# accuracy evaluation frequency
-EVAL_EVERY = 5
+NUM_ROUNDS = 2000
+N_RUNS_PER_V = 5
+EVAL_EVERY = 20
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Fixed params except V
-BATCH_SIZE = 32
-SIGMA_N = 6.287625692659408e-06
-T_MAX = 2814.156090700375
-ETA = 0.053
+BATCH_SIZE = 128
+SIGMA_N = 1e-7
+T_MAX = 200
+ETA = 0.05449628854848185
 BISECTION_TOL = 1e-6
 
 # Client system params
@@ -47,13 +40,13 @@ MU_K = 1e-27
 C_CYCLES_PER_SAMPLE = 1e6
 
 # Dataset split
-DIRICHLET_ALPHA = 0.2
+DIRICHLET_ALPHA = 0.5
 
 # Energy budget range
-E_BUDGET_LOW = 26.37
-E_BUDGET_HIGH = 33.59
+E_BUDGET_LOW = 4164.0
+E_BUDGET_HIGH = 6083
 
-# Optional: filter runs by final accuracy (only affects Plot 1)
+# Optional: filter runs by final accuracy threshold (only affects Plot 1)
 PLOT_FINAL_ACC_THRESHOLD = None  # e.g., 50.0, else None
 
 
@@ -87,7 +80,7 @@ def make_energy_budgets(num_clients: int, low: float, high: float) -> dict:
 
 
 def safe_v_dir_name(v: float) -> str:
-    # keep folder names consistent with your example: V_0.01, V_0.1, V_1, ...
+    # folder names: V_0.01, V_0.1, V_1, ...
     return f"V_{v}"
 
 
@@ -102,17 +95,24 @@ def build_clients(train_dataset, client_data_map, base_model, batch_size, seed_b
             client_id=cid,
             data_indices=indices,
             model=base_model,
-            fk=np.random.uniform(1e9, 2e9),       # 1-2 GHz
+            fk=np.random.uniform(1e9, 2e9),
             mu_k=MU_K,
             P_max=3.0 + np.random.rand(),
             C=C_CYCLES_PER_SAMPLE,
             Ak=batch_size,
             train_dataset=train_dataset,
             device=DEVICE,
-            seed=seed_base + cid,
+            seed=(seed_base + cid) % (2**32 - 1),
         )
         clients.append(client)
     return clients
+
+
+def qmax_e_from_server(server: Server) -> float:
+    """Q_max^e(t) = max_k Q_e^k(t)."""
+    if not hasattr(server, "Q_e") or server.Q_e is None or len(server.Q_e) == 0:
+        return float("nan")
+    return float(max(server.Q_e.values()))
 
 
 # -------------------------
@@ -123,16 +123,21 @@ def run_one(
     run_id: int,
     train_dataset,
     test_loader,
-    base_client_data_map,
     csv_path: str,
     seed: int,
 ):
     set_seed(seed)
 
-    # Re-partition per run (recommended).
-    client_data_map = partition_cifar10_dirichlet(train_dataset, NUM_CLIENTS, alpha=DIRICHLET_ALPHA)
+    # Re-partition per run (recommended)
+    client_data_map = partition_cifar10_dirichlet(
+        train_dataset,
+        NUM_CLIENTS,
+        alpha=float(DIRICHLET_ALPHA),
+        seed=int(seed),
+        min_size=10,
+    )
 
-    # Clients and server
+    # Clients + server
     base_model = CNNCifar10().to(DEVICE)
     clients = build_clients(train_dataset, client_data_map, base_model, BATCH_SIZE, seed_base=seed * 1000)
 
@@ -152,81 +157,105 @@ def run_one(
         bisection_tol=float(BISECTION_TOL),
     )
 
-    # Tracking for unified cumulative energy
+    # Track cumulative energy per client (system energy accounting)
     cum_energy_per_client = {cid: 0.0 for cid in range(NUM_CLIENTS)}
-
-    # Selection counts for per-client fractions
     selection_counts = {cid: 0 for cid in range(NUM_CLIENTS)}
 
-    # Initial metrics at round 0
+    # Round 0 metrics
     acc0 = evaluate_model(server.global_model, test_loader, DEVICE)
+    cum_system_energy0 = 0.0
     unified_energy0 = 0.0
     selected_count0 = 0
-    avg_staleness0 = float(np.mean([c.tau_k for c in clients])) if clients else 0.0
+    avg_staleness0 = float(np.mean([float(getattr(c, "tau_k", 0.0)) for c in clients])) if clients else 0.0
+    qmax0 = qmax_e_from_server(server)
 
     with open(csv_path, "a", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["run_id", "round", "accuracy", "cumulative_energy", "selected_count", "avg_staleness"],
+            fieldnames=[
+                "run_id",
+                "round",
+                "accuracy",
+                "cumulative_energy",
+                "selected_count",
+                "avg_staleness",
+                "qmax_e",
+            ],
         )
         writer.writerow(
             {
-                "run_id": run_id,
+                "run_id": int(run_id),
                 "round": 0,
                 "accuracy": f"{acc0:.6f}",
-                "cumulative_energy": f"{unified_energy0:.6f}",
+                "cumulative_energy": f"{cum_system_energy0:.6f}",
                 "selected_count": str(selected_count0),
                 "avg_staleness": f"{avg_staleness0:.6f}",
+                "qmax_e": f"{qmax0:.6f}" if not np.isnan(qmax0) else "",
             }
         )
 
-    final_acc = acc0
+    final_acc = float(acc0)
 
-    # Main rounds (write rows 1..NUM_ROUNDS)
+    # Main rounds 1..NUM_ROUNDS
+    cum_system_energy = 0.0
     for t in range(NUM_ROUNDS):
         selected, power_alloc, D_t = server.run_round(t)
+
+        # Selected IDs
         selected_ids = [c.client_id for c in selected]
-        selected_count = len(selected_ids)
-
-        # Update selection counts
+        selected_count = int(len(selected_ids))
         for cid in selected_ids:
-            selection_counts[cid] += 1
+            selection_counts[int(cid)] += 1
 
-        # Update cumulative energy per selected client using server.per_round_energy[-1]
-        round_energy_dict = server.per_round_energy[-1] if len(server.per_round_energy) > 0 else {}
+        # Per-round energy from server update_queues()
+        round_energy_dict = server.per_round_energy[-1] if getattr(server, "per_round_energy", None) else {}
         for cid, e_val in round_energy_dict.items():
             cum_energy_per_client[int(cid)] += float(e_val)
 
-        # Unified cumulative energy metric: max_k (cum_energy_k / E_max^k)
-        unified_energy = 0.0
-        for cid in range(NUM_CLIENTS):
-            denom = float(E_max_dict[cid]) if float(E_max_dict[cid]) > 0 else 1.0
-            unified_energy = max(unified_energy, cum_energy_per_client[cid] / denom)
+        # Unified cumulative energy: max_k (cum_energy_k / Emax_k)
+        # unified_energy = 0.0
+        # for cid in range(NUM_CLIENTS):
+        #     denom = float(E_max_dict[cid]) if float(E_max_dict[cid]) > 0 else 1.0
+        #     unified_energy = max(unified_energy, float(cum_energy_per_client[cid]) / denom)
+        E_round = float(server.total_energy_per_round[-1]) if getattr(server, "total_energy_per_round", None) else 0.0
+        cum_system_energy += E_round
 
-        # Avg staleness AFTER the round's staleness updates
-        avg_staleness = float(np.mean([c.tau_k for c in clients])) if clients else 0.0
+        # Staleness after the round
+        avg_staleness = float(np.mean([float(getattr(c, "tau_k", 0.0)) for c in clients])) if clients else 0.0
 
-        # Accuracy only every EVAL_EVERY rounds (and last)
+        # Q_max^e after the queue update
+        qmax_e = qmax_e_from_server(server)
+
+        # Accuracy (sparse logging)
         acc_str = ""
         if ((t + 1) % EVAL_EVERY == 0) or (t == NUM_ROUNDS - 1):
             acc = evaluate_model(server.global_model, test_loader, DEVICE)
-            final_acc = acc
-            acc_str = f"{acc:.6f}"
+            final_acc = float(acc)
+            acc_str = f"{final_acc:.6f}"
 
-        # Save per-round metrics (round index uses 1..NUM_ROUNDS)
+        # Write row for round index t+1
         with open(csv_path, "a", newline="") as f:
             writer = csv.DictWriter(
                 f,
-                fieldnames=["run_id", "round", "accuracy", "cumulative_energy", "selected_count", "avg_staleness"],
+                fieldnames=[
+                    "run_id",
+                    "round",
+                    "accuracy",
+                    "cumulative_energy",
+                    "selected_count",
+                    "avg_staleness",
+                    "qmax_e",
+                ],
             )
             writer.writerow(
                 {
-                    "run_id": run_id,
-                    "round": t + 1,
+                    "run_id": int(run_id),
+                    "round": int(t + 1),
                     "accuracy": acc_str,
-                    "cumulative_energy": f"{unified_energy:.6f}",
+                    "cumulative_energy": f"{cum_system_energy:.6f}",
                     "selected_count": str(selected_count),
                     "avg_staleness": f"{avg_staleness:.6f}",
+                    "qmax_e": f"{qmax_e:.6f}" if not np.isnan(qmax_e) else "",
                 }
             )
 
@@ -234,12 +263,15 @@ def run_one(
 
 
 # -------------------------
-# Plotting (your style), with staleness as subplot (2,2,4)
+# Plotting (your style) + Qmax figure
 # -------------------------
 def plot_results():
+    # 2x2 figure (same style as yours)
     plt.figure(figsize=(15, 10))
 
-    # Plot 1: accuracy progression
+    # -------------------------
+    # Plot 1: Accuracy progression
+    # -------------------------
     plt.subplot(2, 2, 1)
     for v in V_VALUES:
         v_dir = os.path.join(RESULT_ROOT, safe_v_dir_name(v))
@@ -247,7 +279,6 @@ def plot_results():
         if not os.path.exists(csv_path):
             continue
 
-        # Optional: filter runs by final accuracy threshold
         keep_run_ids = None
         if PLOT_FINAL_ACC_THRESHOLD is not None:
             final_acc_by_run = {}
@@ -276,6 +307,7 @@ def plot_results():
 
                 r = int(row["round"])
                 a = float(row["accuracy"])
+
                 if current_round is None:
                     current_round = r
 
@@ -306,7 +338,9 @@ def plot_results():
     plt.legend()
     plt.grid(True)
 
-    # Plot 2: unified cumulative energy (already normalized by E_max^k)
+    # -------------------------
+    # Plot 2: Unified cumulative energy
+    # -------------------------
     plt.subplot(2, 2, 2)
     for v in V_VALUES:
         v_dir = os.path.join(RESULT_ROOT, safe_v_dir_name(v))
@@ -314,27 +348,26 @@ def plot_results():
         if not os.path.exists(csv_path):
             continue
 
-        energy_data = {r: [] for r in range(NUM_ROUNDS + 1)}  # include round 0
+        energy_data = {r: [] for r in range(NUM_ROUNDS + 1)}
         with open(csv_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 r = int(row["round"])
                 energy_data[r].append(float(row["cumulative_energy"]))
 
-        avg_energy = []
-        for r in range(NUM_ROUNDS + 1):
-            avg_energy.append(float(np.mean(energy_data[r])) if energy_data[r] else 0.0)
-
+        avg_energy = [float(np.mean(energy_data[r])) if energy_data[r] else 0.0 for r in range(NUM_ROUNDS + 1)]
         plt.plot(range(NUM_ROUNDS + 1), avg_energy, label=f"V={v}")
 
-    plt.title("Unified Cumulative Energy")
+    plt.title("Unified Cumulative Energy (max_k E_k/Emax_k)")
     plt.xlabel("Communication Rounds")
     plt.ylabel("Max Normalized Energy")
     plt.legend()
     plt.grid(True)
     plt.ylim(0, 1.1)
 
-    # Plot 3: average selection fraction (0..1)
+    # -------------------------
+    # Plot 3: Average selection fraction (0..1)
+    # -------------------------
     plt.subplot(2, 2, 3)
     for v in V_VALUES:
         v_dir = os.path.join(RESULT_ROOT, safe_v_dir_name(v))
@@ -342,7 +375,7 @@ def plot_results():
         if not os.path.exists(csv_path):
             continue
 
-        selection_data = {r: [] for r in range(NUM_ROUNDS + 1)}  # include round 0
+        selection_data = {r: [] for r in range(NUM_ROUNDS + 1)}
         with open(csv_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -350,10 +383,7 @@ def plot_results():
                 frac = float(row["selected_count"]) / float(NUM_CLIENTS)
                 selection_data[r].append(frac)
 
-        avg_sel = []
-        for r in range(NUM_ROUNDS + 1):
-            avg_sel.append(float(np.mean(selection_data[r])) if selection_data[r] else 0.0)
-
+        avg_sel = [float(np.mean(selection_data[r])) if selection_data[r] else 0.0 for r in range(NUM_ROUNDS + 1)]
         plt.plot(range(NUM_ROUNDS + 1), avg_sel, label=f"V={v}")
 
     plt.title("Average Client Selection Fraction (0-1)")
@@ -363,7 +393,9 @@ def plot_results():
     plt.grid(True)
     plt.ylim(0, 1.1)
 
-    # Plot 4: staleness plot (instead of histogram/bar chart)
+    # -------------------------
+    # Plot 4: Average staleness
+    # -------------------------
     plt.subplot(2, 2, 4)
     for v in V_VALUES:
         v_dir = os.path.join(RESULT_ROOT, safe_v_dir_name(v))
@@ -371,17 +403,14 @@ def plot_results():
         if not os.path.exists(csv_path):
             continue
 
-        stale_data = {r: [] for r in range(NUM_ROUNDS + 1)}  # include round 0
+        stale_data = {r: [] for r in range(NUM_ROUNDS + 1)}
         with open(csv_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 r = int(row["round"])
                 stale_data[r].append(float(row["avg_staleness"]))
 
-        avg_stale = []
-        for r in range(NUM_ROUNDS + 1):
-            avg_stale.append(float(np.mean(stale_data[r])) if stale_data[r] else 0.0)
-
+        avg_stale = [float(np.mean(stale_data[r])) if stale_data[r] else 0.0 for r in range(NUM_ROUNDS + 1)]
         plt.plot(range(NUM_ROUNDS + 1), avg_stale, label=f"V={v}")
 
     plt.title("Average Client Staleness")
@@ -396,6 +425,40 @@ def plot_results():
     plt.savefig(out_path, dpi=300)
     plt.close()
     print(f"[Saved] {out_path}")
+
+    # -------------------------
+    # EXTRA FIGURE: Qmax^e vs rounds
+    # -------------------------
+    plt.figure(figsize=(10, 6))
+    for v in V_VALUES:
+        v_dir = os.path.join(RESULT_ROOT, safe_v_dir_name(v))
+        csv_path = os.path.join(v_dir, "round_metrics.csv")
+        if not os.path.exists(csv_path):
+            continue
+
+        q_data = {r: [] for r in range(NUM_ROUNDS + 1)}
+        with open(csv_path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                r = int(row["round"])
+                q_str = row.get("qmax_e", "")
+                if q_str is None or q_str == "":
+                    continue
+                q_data[r].append(float(q_str))
+
+        avg_q = [float(np.mean(q_data[r])) if q_data[r] else 0.0 for r in range(NUM_ROUNDS + 1)]
+        plt.plot(range(NUM_ROUNDS + 1), avg_q, label=f"V={v}")
+
+    plt.title("Max Energy Queue $Q_{\max}^e$ vs Rounds")
+    plt.xlabel("Communication Rounds")
+    plt.ylabel("$Q_{\max}^e$")
+    plt.legend()
+    plt.grid(True)
+    out_q = os.path.join(RESULT_ROOT, "qmax_e_vs_round.png")
+    plt.tight_layout()
+    plt.savefig(out_q, dpi=300)
+    plt.close()
+    print(f"[Saved] {out_q}")
 
 
 # -------------------------
@@ -415,9 +478,6 @@ def main():
     train_dataset, test_dataset = load_cifar10()
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
 
-    # base partition (we re-partition inside each run anyway)
-    base_client_data_map = partition_cifar10_dirichlet(train_dataset, NUM_CLIENTS, alpha=DIRICHLET_ALPHA)
-
     logger.info(f"Device: {DEVICE}")
     logger.info(f"NUM_ROUNDS={NUM_ROUNDS} | N_RUNS_PER_V={N_RUNS_PER_V} | BATCH_SIZE={BATCH_SIZE}")
     logger.info(f"Fixed params: SIGMA_N={SIGMA_N} | T_MAX={T_MAX} | ETA={ETA}")
@@ -429,11 +489,19 @@ def main():
         round_csv = os.path.join(v_dir, "round_metrics.csv")
         frac_csv = os.path.join(v_dir, "client_selection_fractions.csv")
 
-        # Write header fresh each time (overwrite old)
+        # Fresh CSV header (overwrite)
         with open(round_csv, "w", newline="") as f:
             writer = csv.DictWriter(
                 f,
-                fieldnames=["run_id", "round", "accuracy", "cumulative_energy", "selected_count", "avg_staleness"],
+                fieldnames=[
+                    "run_id",
+                    "round",
+                    "accuracy",
+                    "cumulative_energy",
+                    "selected_count",
+                    "avg_staleness",
+                    "qmax_e",
+                ],
             )
             writer.writeheader()
 
@@ -443,24 +511,27 @@ def main():
 
         logger.info(f"=== V={v} ===")
         for run_id in range(N_RUNS_PER_V):
-            seed = 10000 + int(100 * float(v)) + run_id  # deterministic but depends on v
+            seed = 10000 + int(100 * float(v)) + run_id
             t0 = time.time()
+
             final_acc, sel_counts = run_one(
                 v_value=v,
                 run_id=run_id,
                 train_dataset=train_dataset,
                 test_loader=test_loader,
-                base_client_data_map=base_client_data_map,
                 csv_path=round_csv,
                 seed=seed,
             )
+
             dt = time.time() - t0
             final_accs.append(final_acc)
 
             for cid in range(NUM_CLIENTS):
                 total_selection_counts[cid] += int(sel_counts.get(cid, 0))
 
-            logger.info(f"  Run {run_id}/{N_RUNS_PER_V-1} done | final_acc={final_acc:.2f}% | wall={dt/60:.1f} min")
+            logger.info(
+                f"  Run {run_id}/{N_RUNS_PER_V-1} done | final_acc={final_acc:.2f}% | wall={dt/60:.1f} min"
+            )
 
         # Save per-client average selection fraction
         denom = float(N_RUNS_PER_V * NUM_ROUNDS)

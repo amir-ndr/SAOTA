@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
 from client import Client
+# from client_saota_multiple import Client
 from server import Server
 from model import CNNMnist
 from model_cifar import CNNCifar10
@@ -37,15 +38,17 @@ def main():
 
     # ---------------- Parameters ----------------
     NUM_CLIENTS = 10
-    NUM_ROUNDS = 9884
-    BATCH_SIZE = 32
+    NUM_ROUNDS = 2000
+    BATCH_SIZE = 128
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     # SAOTA server params
-    V = 77.23
-    SIGMA_N = 6.287625692659408e-06
-    T_MAX = 2814.156090700375
-    ETA = 0.053
+    V = 196176.9146774444
+    SIGMA_N = 1e-7
+    T_MAX = 200
+    ETA = 0.0544962885484818
+    LOCAL_STEPS = 1
+    LR_LOCAL = 0.0098
     BISECTION_TOL = 1e-6
 
     # Client system params
@@ -81,6 +84,8 @@ def main():
             P_max=3.0 + np.random.rand(),
             C=C_CYCLES_PER_SAMPLE,
             Ak=BATCH_SIZE,
+            # local_steps=LOCAL_STEPS,
+            # lr_local=LR_LOCAL,
             train_dataset=train_dataset,
             device=DEVICE,
             seed=cid,
@@ -89,7 +94,7 @@ def main():
         logger.info(f"Client {cid}: |Dk|={len(indices)} samples, initial dt_k={client.dt_k:.4f}s")
 
     # Per-client total energy budgets (over NUM_ROUNDS)
-    E_max_dict = {cid: float(np.random.uniform(26.37, 33.59)) for cid in range(NUM_CLIENTS)}
+    E_max_dict = {cid: float(np.random.uniform(80, 100)) for cid in range(NUM_CLIENTS)}
     print("Client Energy Budgets:")
     for cid, budget in E_max_dict.items():
         print(f"  Client {cid}: {budget:.2f} J")
