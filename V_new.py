@@ -11,7 +11,8 @@ import matplotlib.pyplot as plt
 from client import Client
 from server import Server
 from model_cifar import CNNCifar10
-from dataloader import load_cifar10, partition_cifar10_dirichlet
+from model import CNNMnist
+from dataloader import load_cifar10, partition_cifar10_dirichlet, load_mnist, partition_mnist_dirichlet
 
 
 # -------------------------
@@ -19,20 +20,20 @@ from dataloader import load_cifar10, partition_cifar10_dirichlet
 # -------------------------
 RESULT_ROOT = "results_v_study2_new"
 
-V_VALUES = [100, 1000, 5000, 10000, 50000, 100000, 150000, 200000, 350000, 500000]
+V_VALUES = [0.01, 0.1, 1, 10, 100, 500, 1000, 5000, 10000, 50000, 100000]
 
 NUM_CLIENTS = 10
-NUM_ROUNDS = 2000
-N_RUNS_PER_V = 5
+NUM_ROUNDS = 780
+N_RUNS_PER_V = 1
 EVAL_EVERY = 20
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Fixed params except V
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 SIGMA_N = 1e-7
-T_MAX = 200
-ETA = 0.05449628854848185
+T_MAX = 21.84
+ETA = 0.09944922699073541
 BISECTION_TOL = 1e-6
 
 # Client system params
@@ -40,11 +41,11 @@ MU_K = 1e-27
 C_CYCLES_PER_SAMPLE = 1e6
 
 # Dataset split
-DIRICHLET_ALPHA = 0.5
+DIRICHLET_ALPHA = 0.2
 
 # Energy budget range
-E_BUDGET_LOW = 4164.0
-E_BUDGET_HIGH = 6083
+E_BUDGET_LOW = 2400.0
+E_BUDGET_HIGH = 2600
 
 # Optional: filter runs by final accuracy threshold (only affects Plot 1)
 PLOT_FINAL_ACC_THRESHOLD = None  # e.g., 50.0, else None
@@ -129,7 +130,7 @@ def run_one(
     set_seed(seed)
 
     # Re-partition per run (recommended)
-    client_data_map = partition_cifar10_dirichlet(
+    client_data_map = partition_mnist_dirichlet(
         train_dataset,
         NUM_CLIENTS,
         alpha=float(DIRICHLET_ALPHA),
@@ -138,12 +139,12 @@ def run_one(
     )
 
     # Clients + server
-    base_model = CNNCifar10().to(DEVICE)
+    base_model = CNNMnist().to(DEVICE)
     clients = build_clients(train_dataset, client_data_map, base_model, BATCH_SIZE, seed_base=seed * 1000)
 
     E_max_dict = make_energy_budgets(NUM_CLIENTS, E_BUDGET_LOW, E_BUDGET_HIGH)
 
-    global_model = CNNCifar10().to(DEVICE)
+    global_model = CNNMnist().to(DEVICE)
     server = Server(
         global_model=global_model,
         clients=clients,
@@ -475,7 +476,7 @@ def main():
     os.makedirs(RESULT_ROOT, exist_ok=True)
 
     # Load data once
-    train_dataset, test_dataset = load_cifar10()
+    train_dataset, test_dataset = load_mnist()
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
 
     logger.info(f"Device: {DEVICE}")

@@ -14,7 +14,11 @@ def partition_mnist_dirichlet(train_dataset, num_clients=10, alpha=0.5, seed=Non
     num_classes = len(np.unique(labels))
     idxs = np.arange(len(labels))
 
-    while True:
+    # Add safeguard to prevent infinite loops with extreme alpha values
+    max_iterations = 100
+    iteration = 0
+
+    while iteration < max_iterations:
         client_data_map = {i: [] for i in range(num_clients)}
 
         for c in range(num_classes):
@@ -31,6 +35,14 @@ def partition_mnist_dirichlet(train_dataset, num_clients=10, alpha=0.5, seed=Non
         sizes = np.array([len(client_data_map[i]) for i in range(num_clients)])
         if sizes.min() >= min_size:
             return client_data_map
+        
+        iteration += 1
+
+    # If max iterations exceeded, return best attempt and warn
+    print(f"⚠️  Max iterations ({max_iterations}) reached for MNIST partition.")
+    print(f"   Min client size: {sizes.min()}, requested: {min_size}")
+    print(f"   Returning partition anyway. Consider increasing min_size or alpha.")
+    return client_data_map
 
 def load_cifar10(root="./data", download=True):
     # Common CIFAR-10 normalization
@@ -63,7 +75,11 @@ def partition_cifar10_dirichlet(train_dataset, num_clients=10, alpha=0.5, seed=N
     num_classes = len(np.unique(labels))
     idxs = np.arange(len(labels))
 
-    while True:
+    # Add safeguard to prevent infinite loops with extreme alpha values
+    max_iterations = 100
+    iteration = 0
+
+    while iteration < max_iterations:
         client_data_map = {i: [] for i in range(num_clients)}
 
         for c in range(num_classes):
@@ -80,3 +96,11 @@ def partition_cifar10_dirichlet(train_dataset, num_clients=10, alpha=0.5, seed=N
         sizes = np.array([len(client_data_map[i]) for i in range(num_clients)])
         if sizes.min() >= min_size:
             return client_data_map
+        
+        iteration += 1
+
+    # If max iterations exceeded, return best attempt and warn
+    print(f"⚠️  Max iterations ({max_iterations}) reached for CIFAR-10 partition.")
+    print(f"   Min client size: {sizes.min()}, requested: {min_size}")
+    print(f"   Returning partition anyway. Consider increasing min_size or alpha.")
+    return client_data_map

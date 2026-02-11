@@ -18,7 +18,9 @@ def evaluate_model(model, test_loader, device="cpu"):
     correct, total = 0, 0
     with torch.no_grad():
         for images, labels in test_loader:
-            images, labels = images.to(device), labels.to(device)
+            # GPU optimization: non_blocking for async transfers
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             outputs = model(images)
             predicted = outputs.argmax(dim=1)
             total += labels.size(0)
@@ -38,17 +40,16 @@ def main():
 
     # ---------------- Parameters ----------------
     NUM_CLIENTS = 10
-    NUM_ROUNDS = 2000
-    BATCH_SIZE = 128
+    NUM_ROUNDS = 782
+    BATCH_SIZE = 64
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     # SAOTA server params
-    V = 196176.9146774444
+    V = 500
     SIGMA_N = 1e-7
-    T_MAX = 200
-    ETA = 0.0544962885484818
-    LOCAL_STEPS = 1
-    LR_LOCAL = 0.0098
+    T_MAX = 21.84
+    ETA = 0.09944922699073541
+    TAU_MAX = 5  # <-- NEW: cap staleness at 50 rounds
     BISECTION_TOL = 1e-6
 
     # Client system params
@@ -59,15 +60,22 @@ def main():
     print(f"Using device: {DEVICE}")
 
     # ---------------- Data ----------------
-    train_dataset, test_dataset = load_cifar10()
-    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+    train_dataset, test_dataset = load_mnist()
+    # GPU optimization: pin_memory for faster transfers (workers disabled for MNIST - overhead too high)
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=256, 
+        shuffle=False, 
+        pin_memory=(DEVICE == "cuda"),
+        num_workers=0  # Disable workers for small MNIST - overhead > benefit
+    )
 
     # Non-IID split
-    client_data_map = partition_cifar10_dirichlet(train_dataset, NUM_CLIENTS, alpha=0.2)
+    client_data_map = partition_mnist_dirichlet(train_dataset, NUM_CLIENTS, alpha=0.2)
 
     # ---------------- Clients ----------------
     clients = []
-    base_model = CNNCifar10().to(DEVICE)
+    base_model = CNNMnist().to(DEVICE)
 
     for cid in range(NUM_CLIENTS):
         indices = client_data_map.get(cid, [])
@@ -94,13 +102,13 @@ def main():
         logger.info(f"Client {cid}: |Dk|={len(indices)} samples, initial dt_k={client.dt_k:.4f}s")
 
     # Per-client total energy budgets (over NUM_ROUNDS)
-    E_max_dict = {cid: float(np.random.uniform(80, 100)) for cid in range(NUM_CLIENTS)}
+    E_max_dict = {cid: float(np.random.uniform(2682, 2884)) for cid in range(NUM_CLIENTS)}
     print("Client Energy Budgets:")
     for cid, budget in E_max_dict.items():
         print(f"  Client {cid}: {budget:.2f} J")
 
     # ---------------- Server ----------------
-    global_model = CNNCifar10().to(DEVICE)
+    global_model = CNNMnist().to(DEVICE)
     server = Server(
         global_model=global_model,
         clients=clients,
@@ -110,6 +118,7 @@ def main():
         E_max=E_max_dict,
         T_total_rounds=NUM_ROUNDS,
         eta=ETA,
+        tau_max=TAU_MAX,
         device=DEVICE,
         bisection_tol=BISECTION_TOL,
     )
@@ -126,6 +135,7 @@ def main():
     avg_staleness_per_round = []
     selected_counts = []
     client_selection_counts = {cid: 0 for cid in range(NUM_CLIENTS)}
+    powers_history = []
 
     # initial eval (time = 0)
     acc0 = evaluate_model(server.global_model, test_loader, DEVICE)
@@ -145,6 +155,9 @@ def main():
         selected_counts.append(len(selected_ids))
         for cid in selected_ids:
             client_selection_counts[cid] += 1
+
+        # Record power allocation for this round (per-client dict)
+        powers_history.append(power_alloc)
 
         # Record duration + update cumulative simulated training time
         D_t = float(D_t)

@@ -14,7 +14,8 @@ import optuna
 from client import Client
 from server import Server
 from model_cifar import CNNCifar10
-from dataloader import load_cifar10, partition_cifar10_dirichlet
+from model import CNNMnist
+from dataloader import load_cifar10, partition_cifar10_dirichlet, load_mnist, partition_mnist_dirichlet
 
 
 # -------------------------
@@ -141,13 +142,13 @@ def objective(trial: optuna.Trial) -> float:
     # -------------------------
     # Search space tuned for CIFAR-10
     # -------------------------
-    NUM_ROUNDS = 2000#trial.suggest_int("NUM_ROUNDS", 2500, 7000)
+    NUM_ROUNDS = trial.suggest_int("NUM_ROUNDS", 300, 1000)
 
     # BATCH_SIZE = trial.suggest_categorical("BATCH_SIZE", [64, 128])
     # LOCAL_STEPS = trial.suggest_categorical("LOCAL_STEPS", [3, 5, 8, 10])
 
     # Global update step (server-side)
-    ETA = trial.suggest_float("ETA", 0.05, 0.1, log=True)
+    ETA = trial.suggest_float("ETA", 0.01, 0.1, log=True)
 
     # Local SGD lr (client-side)
     # LR_LOCAL = trial.suggest_float("LR_LOCAL", 0.005, 0.05, log=True)
@@ -171,14 +172,14 @@ def objective(trial: optuna.Trial) -> float:
     # -------------------------
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     NUM_CLIENTS = 10
-    DIRICHLET_ALPHA = 0.5
+    DIRICHLET_ALPHA = 0.2
 
     # Client system params
     MU_K = 1e-27
     C_CYCLES_PER_SAMPLE = 1e6
 
     # Constraints
-    ACC_TARGET = 65.0
+    ACC_TARGET = 90.0
     SEL_TARGET = 0.5
 
     # Seed per-trial
@@ -188,20 +189,20 @@ def objective(trial: optuna.Trial) -> float:
     # -------------------------
     # Data
     # -------------------------
-    train_dataset, test_dataset = load_cifar10()
+    train_dataset, test_dataset = load_mnist()
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
-    client_data_map = partition_cifar10_dirichlet(train_dataset, NUM_CLIENTS, alpha=DIRICHLET_ALPHA)
+    client_data_map = partition_mnist_dirichlet(train_dataset, NUM_CLIENTS, alpha=DIRICHLET_ALPHA)
 
     # -------------------------
     # Build clients + server
     # -------------------------
-    base_model = CNNCifar10().to(DEVICE)
+    base_model = CNNMnist().to(DEVICE)
     clients = build_clients(
         num_clients=NUM_CLIENTS,
         train_dataset=train_dataset,
         client_data_map=client_data_map,
         base_model=base_model,
-        batch_size=128,
+        batch_size=64,
         device=DEVICE,
         mu_k=MU_K,
         c_cycles_per_sample=C_CYCLES_PER_SAMPLE,
@@ -217,7 +218,7 @@ def objective(trial: optuna.Trial) -> float:
         jitter = float(np.random.uniform(-E_spread, E_spread))
         E_max_dict[cid] = float(E_mean_total * (1.0 + jitter))
 
-    global_model = CNNCifar10().to(DEVICE)
+    global_model = CNNMnist().to(DEVICE)
     server = Server(
         global_model=global_model,
         clients=clients,
@@ -234,7 +235,7 @@ def objective(trial: optuna.Trial) -> float:
     # -------------------------
     # Training + pruning
     # -------------------------
-    eval_every = max(25, NUM_ROUNDS // 25)
+    eval_every = max(10, NUM_ROUNDS // 10)
 
     best_acc = evaluate_model(server.global_model, test_loader, DEVICE)
     trial.report(best_acc, step=0)
